@@ -7,80 +7,70 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
 
-// Supported video extensions from Canon R6 Mk II
 var validExtensions = map[string]bool{
-	".mp4": true,
-	".mov": true,
-	".MXF": true,
-	".mxf": true,
+	".mp4":  true,
+	".mov":  true,
+	".mxf":  true,
 }
 
 func main() {
 	watchDir := flag.String("dir", "", "Path to the root folder on the NAS to monitor")
+	proxyDir := flag.String("proxy-dir", "", "Path to the writable directory where proxies should be saved")
 	flag.Parse()
 
-	if *watchDir == "" {
-		log.Fatal("Please provide a directory to watch using -dir")
+	if *watchDir == "" || *proxyDir == "" {
+		log.Fatal("Please provide both -dir and -proxy-dir flags")
 	}
 
-	absPath, err := filepath.Abs(*watchDir)
+	absWatch, err := filepath.Abs(*watchDir)
 	if err != nil {
-		log.Fatalf("Invalid directory path: %v", err)
+		log.Fatalf("Invalid watch directory path: %v", err)
 	}
 
-	log.Printf("Starting proxy generator watcher on: %s", absPath)
+	absProxy, err := filepath.Abs(*proxyDir)
+	if err != nil {
+		log.Fatalf("Invalid proxy directory path: %v", err)
+	}
 
-	// 1. Initial scan of existing files to process any backlog
+	log.Printf("Watching NAS directory: %s", absWatch)
+	log.Printf("Saving proxies to writable directory: %s", absProxy)
+
+	// 1. Initial scan of existing files
 	go func() {
 		log.Println("Performing initial scan for existing C-Log files...")
-		err := filepath.Walk(absPath, func(path string, info os.FileInfo, err error) error {
+		filepath.Walk(absWatch, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
-			if !info.IsDir() && isValidVideo(path) {
-				processFile(path)
+			if !info.IsDir() && isValidVideo(path, absWatch) {
+				processFile(path, absWatch, absProxy)
 			}
 			return nil
 		})
-		if err != nil {
-			log.Printf("Error scanning existing files: %v", err)
-		} else {
-			log.Println("Initial scan completed. Listening for new files...")
-		}
+		log.Println("Initial scan completed. Listening for new files...")
 	}()
 
-	// 2. Set up fsnotify watcher for real-time additions
+	// 2. Set up fsnotify watcher
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatalf("Failed to create file watcher: %v", err)
 	}
 	defer watcher.Close()
 
-	var wg sync.WaitGroup
-
-	// Recursively add all subdirectories to the watcher
-	err = filepath.Walk(absPath, func(path string, info os.FileInfo, err error) error {
+	filepath.Walk(absWatch, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if info.IsDir() {
-			// Skip existing Proxy folders to avoid infinite loops
-			if info.Name() == "Proxy" {
-				return filepath.SkipDir
-			}
 			return watcher.Add(path)
 		}
 		return nil
 	})
-	if err != nil {
-		log.Fatalf("Failed to walk and add paths to watcher: %v", err)
-	}
 
 	// Event loop
 	for {
@@ -90,7 +80,6 @@ func main() {
 				return
 			}
 
-			// Handle creation of new files or directories
 			if event.Has(fsnotify.Create) {
 				info, err := os.Stat(event.Name)
 				if err != nil {
@@ -98,17 +87,12 @@ func main() {
 				}
 
 				if info.IsDir() {
-					if filepath.Base(event.Name) != "Proxy" {
-						watcher.Add(event.Name)
-						log.Printf("New directory added to watch list: %s", event.Name)
-					}
-				} else if isValidVideo(event.Name) {
-					wg.Add(1)
+					watcher.Add(event.Name)
+					log.Printf("New directory added to watch list: %s", event.Name)
+				} else if isValidVideo(event.Name, absWatch) {
 					go func(filePath string) {
-						defer wg.Done()
-						// Slight delay to ensure the file finished writing/copying over the network
-						time.Sleep(2 * time.Second)
-						processFile(filePath)
+						time.Sleep(2 * time.Second) // Wait for network copy to finish
+						processFile(filePath, absWatch, absProxy)
 					}(event.Name)
 				}
 			}
@@ -122,57 +106,54 @@ func main() {
 	}
 }
 
-func isValidVideo(path string) bool {
-	ext := filepath.Ext(path)
-	// Ignore files already inside a Proxy folder
-	if strings.Contains(path, string(filepath.Separator)+"Proxy"+string(filepath.Separator)) {
-		return false
-	}
+func isValidVideo(path string, rootDir string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
 	return validExtensions[ext]
 }
 
-func processFile(srcPath string) {
-	dir := filepath.Dir(srcPath)
-	filename := filepath.Base(srcPath)
-	ext := filepath.Ext(filename)
-	nameOnly := strings.TrimSuffix(filename, ext)
-
-	// DaVinci Resolve standard proxy folder structure: <SourceDir>/Proxy/<Filename>.mov
-	proxyDir := filepath.Join(dir, "Proxy")
-	if err := os.MkdirAll(proxyDir, 0755); err != nil {
-		log.Printf("Failed to create proxy directory %s: %v", proxyDir, err)
+func processFile(srcPath string, rootDir string, proxyRoot string) {
+	// Calculate relative path from the root watch directory to preserve folder structure
+	relPath, err := filepath.Rel(rootDir, srcPath)
+	if err != nil {
+		log.Printf("Failed to get relative path for %s: %v", srcPath, err)
 		return
 	}
 
-	proxyPath := filepath.Join(proxyDir, nameOnly+".mov")
+	// Change extension to .mov for proxy
+	ext := filepath.Ext(relPath)
+	relProxyPath := strings.TrimSuffix(relPath, ext) + ".mov"
+	
+	destPath := filepath.Join(proxyRoot, relProxyPath)
+	destDir := filepath.Dir(destPath)
+
+	// Create mirrored subdirectories in the writable proxy location
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		log.Printf("Failed to create proxy directory %s: %v", destDir, err)
+		return
+	}
 
 	// Check if proxy already exists
-	if _, err := os.Stat(proxyPath); err == nil {
-		// Proxy already exists, skip
+	if _, err := os.Stat(destPath); err == nil {
 		return
 	}
 
-	log.Printf("Generating proxy for: %s", filename)
+	log.Printf("Generating proxy for: %s", relPath)
 
-	// FFmpeg command optimized for DaVinci Resolve proxies:
-	// - Half resolution (1920x1080 for 4K source)
-	// - ProRes 422 Proxy or DNxHR LB (ProRes is native and smooth, use DNxHR if on Windows without ProRes license,
-	//   though ffmpeg's internal prores encoder works great).
 	cmd := exec.Command("ffmpeg",
 		"-i", srcPath,
-		"-vf", "scale=iw/2:ih/2", // Downscale 4K C-Log to 1080p proxy
+		"-vf", "scale=iw/2:ih/2",
 		"-c:v", "prores_ks",
-		"-profile:v", "0", // ProRes 0 = ProRes Proxy
-		"-c:a", "pcm_s16le", // Uncompressed audio for timeline sync
+		"-profile:v", "0",
+		"-c:a", "pcm_s16le",
 		"-y",
-		proxyPath,
+		destPath,
 	)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("Error generating proxy for %s: %v\nOutput: %s", filename, err, string(output))
+		log.Printf("Error generating proxy for %s: %v\nOutput: %s", relPath, err, string(output))
 		return
 	}
 
-	log.Printf("Successfully generated proxy: %s", proxyPath)
+	log.Printf("Successfully generated proxy: %s", destPath)
 }

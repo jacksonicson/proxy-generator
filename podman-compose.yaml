@@ -1,19 +1,18 @@
-/mnt/nas/photography/photos/pic_lightroom/2026/2026-10-10
-
-
 version: '3.8'
 
 services:
   proxy-generator:
     build: .
-    image: nas-proxy-generator
-    container_name: nas-proxy-generator
+    image: proxy-generator
+    container_name: proxy-generator
     restart: unless-stopped
     volumes:
       # Left side: Path to your NAS mount on your Optiplex host
       # Right side: Inside the container (/data)
-      - /mnt/nas/photography/photos/pic_lightroom/2026/2026-10-10:/data
-    command: ["-dir", "/data"]
+      - /mnt/nas/photography/photos/pic_lightroom:/data
+      # Writable mount for local proxy storage on your Optiplex SSD
+      - /mnt/proxy:/local-proxies
+    command: ["-dir", "/data", "-proxy-dir", "/local-proxies"]
     # If your Optiplex uses an Intel iGPU for hardware acceleration, uncomment below:
     devices:
       - /dev/dri:/dev/dri
